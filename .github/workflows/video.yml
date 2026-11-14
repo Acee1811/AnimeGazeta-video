@@ -1,0 +1,95 @@
+# Репозиторий для видео сайта AnimeGazeta. Файл нужен по пути .github/workflows/video.yml.
+# Запускается из админки сайта (кнопка «Загрузить видео» или ссылка на пост в X в поле «Видео»):
+#  • mode=file — админка заранее кладёт файл кусками в ветку inbox-<id>, здесь они склеиваются;
+#  • mode=url  — здесь скачивается видео из поста X (или прямой .mp4-ссылки).
+# Результат — файл <id>.mp4 во вложениях релиза «media»; ссылка вставляется в новость автоматически.
+name: video
+run-name: video ${{ inputs.id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: "Имя файла без расширения"
+        required: true
+      mode:
+        description: "file или url"
+        required: true
+      url:
+        description: "Ссылка на пост X или на .mp4 (для mode=url)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ID: ${{ inputs.id }}
+      MODE: ${{ inputs.mode }}
+      URL: ${{ inputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.mode == 'file' && format('inbox-{0}', inputs.id) || github.ref }}
+
+      - name: Подготовить видео
+        run: |
+          set -e
+          OUT="$RUNNER_TEMP/$ID.mp4"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+          if [ "$MODE" = "file" ]; then
+            cat parts/* > "$OUT"
+          else
+            pip install -q yt-dlp requests
+            OUT="$OUT" python3 - <<'PY'
+          import os, re, subprocess, sys, requests
+          url, out = os.environ["URL"].strip(), os.environ["OUT"]
+          UA = {"User-Agent": "Mozilla/5.0"}
+
+          def download(u):
+              with requests.get(u, stream=True, timeout=60, headers=UA) as r:
+                  r.raise_for_status()
+                  with open(out, "wb") as f:
+                      for c in r.iter_content(1 << 20):
+                          f.write(c)
+
+          m = re.search(r"/status/(\d+)", url)
+          if not m:
+              download(url)          # прямая ссылка на видео
+              sys.exit(0)
+          ok = False
+          try:
+              d = requests.get(f"https://cdn.syndication.twimg.com/tweet-result?id={m.group(1)}&token=a",
+                               timeout=20, headers=UA).json()
+              best = None
+              for md in d.get("mediaDetails") or []:
+                  if md.get("type") in ("video", "animated_gif"):
+                      for v in (md.get("video_info") or {}).get("variants") or []:
+                          if v.get("content_type") == "video/mp4" and (not best or v.get("bitrate", 0) > best.get("bitrate", 0)):
+                              best = v
+              if best:
+                  download(best["url"])
+                  ok = True
+          except Exception as e:
+              print("syndication:", e)
+          if not ok:
+              subprocess.run(["yt-dlp", "-f", "best[ext=mp4]/best", "--merge-output-format", "mp4", "-o", out, url], check=True)
+          PY
+          fi
+          test -s "$OUT"
+          ls -la "$OUT"
+
+      - name: Положить в релиз media
+        run: |
+          set -e
+          gh release view media >/dev/null 2>&1 || gh release create media --prerelease --title "Видео" --notes "Служебный релиз: сюда складываются видео для сайта. Не удаляйте."
+          gh release upload media "$OUT" --clobber
+
+      - name: Убрать временную ветку
+        if: ${{ always() && inputs.mode == 'file' }}
+        run: gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/inbox-$ID" || true
